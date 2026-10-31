@@ -48,6 +48,21 @@
   let beats = 0;
   const heartbeat = setInterval(() => { beats++; report('page vivante ' + (beats * 5) + ' s'); if (beats >= 6) clearInterval(heartbeat); }, 5000);
   const msg = document.getElementById('msg');
+  // Synchronisation : t0 = seconde de depart de la video (serveur), s = heure du serveur au moment du lancement.
+  // Temps ecoule = (s - t0) + temps depuis le chargement de la page. Chaque joueur se cale dessus, meme apres une pub.
+  const loadStart = performance.now();
+  const serverNow = Number(params.get('s'));
+  let startAt = null;   // t0
+  function elapsed() {
+    if (startAt === null || !isFinite(serverNow) || serverNow <= 0) return null;
+    return Math.max(0, (serverNow - startAt) + (performance.now() - loadStart) / 1000);
+  }
+  function wrap(pos, duration) { return duration > 0 ? pos % duration : pos; }
+  function drift(cur, exp, duration) {
+    let d = Math.abs(cur - exp);
+    if (duration > 0) d = Math.min(d, duration - d);
+    return d;
+  }
   let apiReady = false, player = null, pending = null, volume = 100, kind = null;
 
   const ERRORS = {
@@ -99,13 +114,17 @@
     videoBox.innerHTML = '';
     frameBox.innerHTML = '';
     ytBox.style.display = 'block';
-    if (!apiReady) { pending = { kind: 'youtube', id }; return; }
+    if (!apiReady) { pending = { kind: 'youtube', id, t0: startAt }; return; }
     if (!player) {
       player = new YT.Player('yt', {
         width: '100%', height: '100%', videoId: id,
         playerVars: { autoplay: 1, controls: 0, disablekb: 1, modestbranding: 1, rel: 0, fs: 0, iv_load_policy: 3, playsinline: 1, origin: location.origin },
         events: {
-          onReady: (e) => { dbg('lecteur pret'); e.target.setVolume(volume); e.target.playVideo(); },
+          onReady: (e) => {
+            dbg('lecteur pret'); e.target.setVolume(volume); e.target.playVideo();
+            const el = elapsed();
+            if (el !== null && el > 2) { const d = e.target.getDuration(); e.target.seekTo(wrap(el, d), true); dbg('calage a ' + Math.round(wrap(el, d)) + ' s'); }
+          },
           onError: (e) => { dbg('erreur YouTube ' + e.data); showMessage((ERRORS[e.data] || 'Erreur YouTube') + ' (' + e.data + ')'); },
           onStateChange: (e) => {
             dbg('etat ' + e.data);
@@ -153,6 +172,7 @@
     const v = document.createElement('video');
     v.src = url; v.autoplay = true; v.loop = true; v.playsInline = true; v.volume = volume / 100;
     v.onerror = () => showMessage('Fichier vidéo illisible');
+    v.onloadedmetadata = () => { const el = elapsed(); if (el !== null && el > 2) v.currentTime = wrap(el, v.duration); };
     videoBox.appendChild(v);
     v.play().catch(() => {});
   }
@@ -161,6 +181,7 @@
     showMessage('');
     if (!valid(m)) return showMessage('Lien non valide');
     kind = m.kind;
+    startAt = typeof m.t0 === 'number' ? m.t0 : null;
     dbg('lecture : ' + m.kind);
     if (m.kind === 'youtube') playYoutube(m.id);
     else if (m.kind === 'video') playVideo(m.url);
@@ -183,6 +204,26 @@
     if (first) play(JSON.parse(first));
     else showMessage('');
   } catch (e) { showMessage('Lien non valide'); }
+
+  setInterval(() => {
+    const el = elapsed();
+    if (el === null) return;
+    try {
+      if (kind === 'youtube' && player && player.getPlayerState && player.getPlayerState() === 1) {
+        const d = player.getDuration();
+        if (d > 0) {
+          const exp = wrap(el, d);
+          if (drift(player.getCurrentTime(), exp, d) > 3) { player.seekTo(exp, true); dbg('recalage a ' + Math.round(exp) + ' s'); }
+        }
+      } else if (kind === 'video') {
+        const v = videoBox.querySelector('video');
+        if (v && v.duration > 0 && !v.paused) {
+          const exp = wrap(el, v.duration);
+          if (drift(v.currentTime, exp, v.duration) > 3) v.currentTime = exp;
+        }
+      }
+    } catch (e) {}
+  }, 4000);
 
   window.addEventListener('message', (e) => {
     const d = e.data || {};
