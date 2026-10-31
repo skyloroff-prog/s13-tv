@@ -1,0 +1,195 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; font-family: sans-serif; }
+  #yt, video, iframe { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; background: #000; }
+  #dbg { position: absolute; left: 12px; bottom: 10px; z-index: 9; font: 20px monospace; color: #9f9;
+         background: rgba(0,0,0,.65); padding: 4px 10px; display: none; white-space: pre; }
+  #msg { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; text-align: center;
+         color: #fff; font-size: 48px; padding: 0 80px; background: #111; }
+</style>
+</head>
+<body>
+<div id="yt"></div>
+<div id="video"></div>
+<div id="frame"></div>
+<div id="msg" style="display:flex">Chargement…</div>
+<div id="dbg"></div>
+<script src="https://www.youtube.com/iframe_api"></script>
+<script>
+  // Même méthode que les télés FiveM open source : le lecteur officiel de YouTube (IFrame API), qui envoie l'origine
+  // de la page à YouTube (sans elle : erreur 153 « Video player configuration error »).
+  const ytBox = document.getElementById('yt');
+  const videoBox = document.getElementById('video');
+  const frameBox = document.getElementById('frame');
+  const dbgBox = document.getElementById('dbg');
+  const params = new URLSearchParams(location.search);
+  const DEBUG = params.get('d') === '1';
+  let dbgLines = [];
+  // Rapport envoye au serveur de jeu (meme adresse que la page) : permet de voir en direct ce qui se passe en jeu
+  function report(text) {
+    if (!DEBUG || location.hostname.endsWith('github.io')) return;   // page hebergee : pas de rapport vers le serveur de jeu (http)
+    try { fetch('report?t=' + encodeURIComponent(String(text).slice(0, 250)), { mode: 'no-cors', cache: 'no-store' }).catch(() => {}); } catch (e) {}
+  }
+  window.addEventListener('error', (e) => report('ERREUR JS : ' + e.message + ' (' + (e.filename || '').split('/').pop() + ':' + e.lineno + ')'));
+  window.addEventListener('unhandledrejection', (e) => report('PROMESSE REJETEE : ' + e.reason));
+  function dbg(text) {
+    report(text);
+    if (!DEBUG) return;
+    dbgLines.push(text); if (dbgLines.length > 4) dbgLines.shift();
+    dbgBox.textContent = dbgLines.join('\n'); dbgBox.style.display = 'block';
+    clearTimeout(dbg.t); dbg.t = setTimeout(() => { dbgBox.style.display = 'none'; }, 25000);
+  }
+  dbg('page chargee (' + location.host + ')');
+  report('navigateur : ' + navigator.userAgent);
+  let beats = 0;
+  const heartbeat = setInterval(() => { beats++; report('page vivante ' + (beats * 5) + ' s'); if (beats >= 6) clearInterval(heartbeat); }, 5000);
+  const msg = document.getElementById('msg');
+  let apiReady = false, player = null, pending = null, volume = 100, kind = null;
+
+  const ERRORS = {
+    2: 'Lien de vidéo invalide',
+    5: 'Cette vidéo ne peut pas être lue ici',
+    100: 'Vidéo introuvable ou privée',
+    101: 'Le propriétaire interdit la lecture sur d\'autres sites',
+    150: 'Le propriétaire interdit la lecture sur d\'autres sites',
+    153: 'YouTube refuse la lecture (origine manquante)',
+  };
+  function showMessage(text) { msg.textContent = text; msg.style.display = text ? 'flex' : 'none'; }
+
+  // Mêmes règles que le serveur : YouTube (id de 11 caractères) ou fichier .mp4 / .webm en https
+  function valid(m) {
+    if (!m || typeof m !== 'object') return false;
+    if (m.kind === 'youtube') return typeof m.id === 'string' && /^[\w-]{11}$/.test(m.id);
+    if (m.kind === 'video') return typeof m.url === 'string' && /^https:\/\/[^\s]+\.(mp4|webm)(\?[^\s]*)?$/i.test(m.url);
+    if (m.kind === 'vimeo') return typeof m.id === 'string' && /^\d{1,12}$/.test(m.id);
+    if (m.kind === 'dailymotion') return typeof m.id === 'string' && /^[A-Za-z0-9]{1,12}$/.test(m.id);
+    if (m.kind === 'twitch') {
+      const ok = (v, re) => typeof v === 'string' && re.test(v);
+      return ok(m.channel, /^[a-z0-9_]{3,25}$/) || ok(m.video, /^\d{1,15}$/) || ok(m.clip, /^[A-Za-z0-9_-]{1,80}$/);
+    }
+    return false;
+  }
+
+  setTimeout(() => {
+    if (!apiReady && kind === 'youtube' || (!apiReady && pending)) {
+      dbg('API YouTube non chargee apres 10 s');
+      showMessage('YouTube inaccessible depuis le serveur de jeu');
+    }
+  }, 10000);
+
+  window.onYouTubeIframeAPIReady = () => {
+    apiReady = true;
+    dbg('API YouTube prete');
+    if (pending) { const m = pending; pending = null; play(m); }
+  };
+
+  function stop() {
+    showMessage('');
+    videoBox.innerHTML = '';
+    frameBox.innerHTML = '';
+    if (player) { try { player.stopVideo(); } catch (e) {} }
+    kind = null;
+  }
+
+  function playYoutube(id) {
+    videoBox.innerHTML = '';
+    frameBox.innerHTML = '';
+    ytBox.style.display = 'block';
+    if (!apiReady) { pending = { kind: 'youtube', id }; return; }
+    if (!player) {
+      player = new YT.Player('yt', {
+        width: '100%', height: '100%', videoId: id,
+        playerVars: { autoplay: 1, controls: 0, disablekb: 1, modestbranding: 1, rel: 0, fs: 0, iv_load_policy: 3, playsinline: 1, origin: location.origin },
+        events: {
+          onReady: (e) => { dbg('lecteur pret'); e.target.setVolume(volume); e.target.playVideo(); },
+          onError: (e) => { dbg('erreur YouTube ' + e.data); showMessage((ERRORS[e.data] || 'Erreur YouTube') + ' (' + e.data + ')'); },
+          onStateChange: (e) => {
+            dbg('etat ' + e.data);
+            if (e.data === YT.PlayerState.PLAYING) showMessage('');
+            if (e.data === YT.PlayerState.ENDED) { player.seekTo(0, true); player.playVideo(); }
+          },
+        },
+      });
+    } else {
+      player.loadVideoById({ videoId: id });
+      player.setVolume(volume);
+    }
+  }
+
+  // Vimeo, Dailymotion, Twitch : lecteurs officiels en iframe (la page est servie en http, ils l'acceptent)
+  function playFrame(m) {
+    if (player) { try { player.stopVideo(); } catch (e) {} }
+    ytBox.style.display = 'none';
+    videoBox.innerHTML = '';
+    frameBox.innerHTML = '';
+    let src;
+    if (m.kind === 'vimeo') {
+      src = 'https://player.vimeo.com/video/' + m.id + '?autoplay=1&loop=1&title=0&byline=0&portrait=0&controls=0';
+    } else if (m.kind === 'dailymotion') {
+      src = 'https://www.dailymotion.com/embed/video/' + m.id + '?autoplay=1&controls=0&mute=0&ui-logo=0&queue-enable=0';
+    } else if (m.channel) {
+      src = 'https://player.twitch.tv/?channel=' + m.channel + '&parent=' + location.hostname + '&autoplay=true&muted=false';
+    } else if (m.video) {
+      src = 'https://player.twitch.tv/?video=v' + m.video + '&parent=' + location.hostname + '&autoplay=true&muted=false';
+    } else {
+      src = 'https://clips.twitch.tv/embed?clip=' + m.clip + '&parent=' + location.hostname + '&autoplay=true&muted=false';
+    }
+    const f = document.createElement('iframe');
+    f.allow = 'autoplay; encrypted-media; fullscreen';
+    f.referrerPolicy = 'strict-origin-when-cross-origin';
+    f.src = src;
+    frameBox.appendChild(f);
+  }
+
+  function playVideo(url) {
+    if (player) { try { player.stopVideo(); } catch (e) {} }
+    frameBox.innerHTML = '';
+    ytBox.style.display = 'none';
+    videoBox.innerHTML = '';
+    const v = document.createElement('video');
+    v.src = url; v.autoplay = true; v.loop = true; v.playsInline = true; v.volume = volume / 100;
+    v.onerror = () => showMessage('Fichier vidéo illisible');
+    videoBox.appendChild(v);
+    v.play().catch(() => {});
+  }
+
+  function play(m) {
+    showMessage('');
+    if (!valid(m)) return showMessage('Lien non valide');
+    kind = m.kind;
+    dbg('lecture : ' + m.kind);
+    if (m.kind === 'youtube') playYoutube(m.id);
+    else if (m.kind === 'video') playVideo(m.url);
+    else playFrame(m);
+  }
+
+  function setVolume(v) {
+    volume = Math.max(0, Math.min(100, Math.round(v * 100)));
+    if (kind === 'youtube' && player && player.setVolume) { try { player.setVolume(volume); } catch (e) {} }
+    else if (kind === 'video') { const el = videoBox.querySelector('video'); if (el) el.volume = volume / 100; }
+    else if (kind === 'vimeo') {
+      const f = frameBox.querySelector('iframe');
+      if (f && f.contentWindow) f.contentWindow.postMessage(JSON.stringify({ method: 'setVolume', value: volume / 100 }), '*');
+    }
+  }
+
+  // La video a lancer est dans l'adresse de la page (?m=...) : rien ne peut se perdre pendant le chargement.
+  try {
+    const first = new URLSearchParams(location.search).get('m');
+    if (first) play(JSON.parse(first));
+    else showMessage('');
+  } catch (e) { showMessage('Lien non valide'); }
+
+  window.addEventListener('message', (e) => {
+    const d = e.data || {};
+    if (d.type === 'play') play(d.media);
+    else if (d.type === 'volume') setVolume(Number(d.v) || 0);
+    else if (d.type === 'stop') stop();
+  });
+</script>
+</body>
+</html>
